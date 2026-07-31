@@ -1,4 +1,5 @@
 # frozen_string_literal: true
+
 set :dir_root, "/Users/killian/Sites/Live Coding/Sonic Pi Experiments/src"
 set :resource_root, "/Users/killian/Documents/Music Resources/"
 eval_file "#{get(:dir_root)}/lib/global_clock.rb"
