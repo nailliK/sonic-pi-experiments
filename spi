@@ -1,0 +1,361 @@
+#!/usr/bin/env python3
+"""spi - a tiny CLI for driving a running Sonic Pi 5 instance.
+
+Talks OSC to the Spider server of whichever Sonic Pi is currently running,
+discovering its (dynamic) ports and auth token from the process table.
+
+  spi run FILE            evaluate a file as a new Run
+  spi eval CODE           evaluate a string (or stdin with -)
+  spi stop                stop all jobs
+  spi watch PATH...       re-run files whenever they change
+  spi info                show the discovered ports and token
+"""
+
+import argparse
+import os
+import re
+import socket
+import struct
+import subprocess
+import sys
+import time
+
+DEFAULT_EXTS = (".rb", ".spi", ".sonicpi")
+
+
+# --- OSC ---------------------------------------------------------------
+
+def _pad(b: bytes) -> bytes:
+    return b + b"\0" * (4 - len(b) % 4)
+
+
+def osc_message(address: str, *args) -> bytes:
+    """Encode a minimal OSC 1.0 message. Supports int, float, str and bytes."""
+    tags = ","
+    body = b""
+    for a in args:
+        if isinstance(a, bool):
+            a = int(a)
+        if isinstance(a, int):
+            tags += "i"
+            body += struct.pack(">i", a)
+        elif isinstance(a, float):
+            tags += "f"
+            body += struct.pack(">f", a)
+        elif isinstance(a, bytes):
+            tags += "b"
+            body += struct.pack(">i", len(a)) + _pad(a)
+        else:
+            tags += "s"
+            body += _pad(str(a).encode("utf-8"))
+    return _pad(address.encode("utf-8")) + _pad(tags.encode("utf-8")) + body
+
+
+def send(port: int, address: str, *args) -> None:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.sendto(osc_message(address, *args), ("127.0.0.1", port))
+    finally:
+        sock.close()
+
+
+# --- discovery ---------------------------------------------------------
+
+class NotRunning(Exception):
+    pass
+
+
+class SonicPi:
+    """Connection details for the running Sonic Pi server."""
+
+    def __init__(self, pid, listen, gui, scsynth, scsynth_send, cues, token):
+        self.pid = pid
+        self.listen = listen              # spider-listen-to-gui: we send here
+        self.gui = gui                    # spider-send-to-gui (owned by the GUI)
+        self.scsynth = scsynth
+        self.scsynth_send = scsynth_send
+        self.cues = cues                  # osc-cues port, normally 4560
+        self.token = token
+
+    @classmethod
+    def discover(cls):
+        """Find the running spider server and read its ports + token from argv.
+
+        The daemon picks random ports and a random token at boot and passes
+        them to spider-server.rb as:
+            [-u|-t] listen gui scsynth scsynth-send osc-cues token
+        """
+        try:
+            ps = subprocess.run(
+                ["ps", "-Awwo", "pid=,args="],
+                capture_output=True, text=True, check=True,
+            ).stdout
+        except (OSError, subprocess.CalledProcessError) as e:
+            raise NotRunning(f"could not list processes: {e}")
+
+        for line in ps.splitlines():
+            if "spider-server.rb" not in line or "-o pid=" in line:
+                continue
+            pid = int(line.split(None, 1)[0])
+            tail = line.split("spider-server.rb", 1)[1].split()
+            if tail and tail[0] in ("-u", "-t"):
+                tail = tail[1:]
+            nums = [int(t) for t in tail if re.fullmatch(r"-?\d+", t)]
+            if len(nums) < 6:
+                continue
+            return cls(pid, *nums[:6])
+
+        raise NotRunning(
+            "no running Sonic Pi found - start Sonic Pi and wait for it to boot"
+        )
+
+    def run_code(self, code: str, workspace: str = None) -> None:
+        if workspace:
+            send(self.listen, "/run-code", self.token, code, workspace)
+        else:
+            send(self.listen, "/run-code", self.token, code)
+
+    def stop(self) -> None:
+        send(self.listen, "/stop-all-jobs", self.token)
+
+    def ping(self, msg: str = "spi") -> None:
+        send(self.listen, "/ping", self.token, msg)
+
+    def cue(self, path: str, *args) -> None:
+        send(self.cues, path, *args)
+
+
+# --- commands ----------------------------------------------------------
+
+def read_source(path: str) -> str:
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read()
+
+
+def workspace_name(path: str) -> str:
+    """Label shown in Sonic Pi's log and in error messages."""
+    return os.path.abspath(path)
+
+
+def display_name(path: str) -> str:
+    """Short label for our own console output."""
+    try:
+        rel = os.path.relpath(path)
+    except ValueError:
+        return path
+    return path if rel.startswith("..") else rel
+
+
+def cmd_run(sp: SonicPi, args) -> int:
+    code = read_source(args.file)
+    if args.stop_first:
+        sp.stop()
+        time.sleep(0.05)
+    sp.run_code(code, workspace_name(args.file))
+    if not args.quiet:
+        print(f"-> ran {args.file}")
+    return 0
+
+
+def cmd_eval(sp: SonicPi, args) -> int:
+    code = sys.stdin.read() if args.code == "-" else args.code
+    sp.run_code(code)
+    return 0
+
+
+def cmd_stop(sp: SonicPi, args) -> int:
+    sp.stop()
+    if not args.quiet:
+        print("-> stopped all jobs")
+    return 0
+
+
+def cmd_cue(sp: SonicPi, args) -> int:
+    def coerce(v):
+        try:
+            return int(v)
+        except ValueError:
+            pass
+        try:
+            return float(v)
+        except ValueError:
+            return v
+
+    path = args.path if args.path.startswith("/") else "/" + args.path
+    sp.cue(path, *[coerce(a) for a in args.args])
+    return 0
+
+
+def cmd_info(sp: SonicPi, args) -> int:
+    print(f"pid           {sp.pid}")
+    print(f"send to       127.0.0.1:{sp.listen}   (spider listens here)")
+    print(f"gui port      {sp.gui}")
+    print(f"scsynth       {sp.scsynth} (send {sp.scsynth_send})")
+    print(f"osc cues      {sp.cues}")
+    print(f"token         {sp.token}")
+    return 0
+
+
+# --- watch -------------------------------------------------------------
+
+def collect(paths, exts):
+    """Expand the watch targets into a {path: mtime} snapshot."""
+    found = {}
+    for p in paths:
+        if os.path.isdir(p):
+            for root, dirs, files in os.walk(p):
+                dirs[:] = [d for d in dirs if not d.startswith(".")]
+                for name in files:
+                    if name.startswith(".") or not name.endswith(exts):
+                        continue
+                    f = os.path.join(root, name)
+                    try:
+                        found[f] = os.stat(f).st_mtime
+                    except OSError:
+                        pass
+        else:
+            try:
+                found[p] = os.stat(p).st_mtime
+            except OSError:
+                found[p] = None
+    return found
+
+
+def cmd_watch(sp: SonicPi, args) -> int:
+    exts = tuple(e if e.startswith(".") else "." + e for e in args.ext) \
+        if args.ext else DEFAULT_EXTS
+    paths = args.paths or ["."]
+
+    seen = collect(paths, exts)
+    print(f"watching {', '.join(paths)} (pid {sp.pid}, port {sp.listen})")
+    print(f"  {len(seen)} file(s), extensions: {' '.join(exts)}")
+    if args.run_now:
+        for f in sorted(seen):
+            safe_fire(sp, f, args)
+    print("  ctrl-c to quit")
+
+    try:
+        while True:
+            time.sleep(args.interval)
+            current = collect(paths, exts)
+            changed = [
+                f for f, m in current.items()
+                if m is not None and seen.get(f) != m
+            ]
+            seen = current
+            if not changed:
+                continue
+            # Debounce: let a burst of saves settle before firing.
+            time.sleep(args.interval)
+            seen = collect(paths, exts)
+            for f in sorted(changed):
+                safe_fire(sp, f, args)
+    except KeyboardInterrupt:
+        print("\nbye")
+        return 0
+
+
+def safe_fire(sp: SonicPi, path: str, args) -> None:
+    """Never let one bad file end the session - report and keep watching."""
+    try:
+        fire(sp, path, args)
+    except Exception as e:  # noqa: BLE001 - a live tool must not die mid-set
+        print(f"[{time.strftime('%H:%M:%S')}] ! {path}: {e}")
+
+
+def fire(sp: SonicPi, path: str, args) -> None:
+    stamp = time.strftime("%H:%M:%S")
+    try:
+        code = read_source(path)
+    except OSError as e:
+        print(f"[{stamp}] ! {path}: {e}")
+        return
+
+    rel = display_name(path)
+
+    # An escape hatch for files that live alongside your music but must never
+    # be evaluated - editor stubs, notes, helper scratch files.
+    if "spi:ignore" in code[:512]:
+        print(f"[{stamp}] - {rel} (spi:ignore)")
+        return
+
+    if not code.strip():
+        sp.stop()
+        print(f"[{stamp}] . {rel} is empty - stopped all jobs")
+        return
+
+    if args.stop_first:
+        sp.stop()
+        time.sleep(0.05)
+    sp.run_code(code, workspace_name(path))
+    print(f"[{stamp}] > {rel}")
+
+
+# --- entry point -------------------------------------------------------
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="spi",
+        description="Drive a running Sonic Pi 5 instance from the command line.",
+    )
+    parser.add_argument("-q", "--quiet", action="store_true",
+                        help="suppress confirmation output")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p = sub.add_parser("run", help="evaluate a file as a new Run")
+    p.add_argument("file")
+    p.add_argument("-s", "--stop-first", action="store_true",
+                   help="stop all jobs before running")
+    p.set_defaults(func=cmd_run)
+
+    p = sub.add_parser("eval", help="evaluate a string ('-' reads stdin)")
+    p.add_argument("code")
+    p.set_defaults(func=cmd_eval)
+
+    p = sub.add_parser("stop", help="stop all running jobs")
+    p.set_defaults(func=cmd_stop)
+
+    p = sub.add_parser("watch", help="re-run files whenever they change")
+    p.add_argument("paths", nargs="*", metavar="PATH",
+                   help="files or directories to watch (default: .)")
+    p.add_argument("-e", "--ext", action="append", metavar="EXT",
+                   help="file extension to watch (repeatable; "
+                        f"default: {' '.join(DEFAULT_EXTS)})")
+    p.add_argument("-i", "--interval", type=float, default=0.2,
+                   metavar="SECS", help="poll interval (default: 0.2)")
+    p.add_argument("-s", "--stop-first", dest="stop_first", action="store_true",
+                   default=True, help="stop all jobs before each run (default)")
+    p.add_argument("-S", "--no-stop-first", dest="stop_first",
+                   action="store_false", help="leave running jobs alone")
+    p.add_argument("-n", "--run-now", action="store_true",
+                   help="run everything once on startup")
+    p.set_defaults(func=cmd_watch)
+
+    p = sub.add_parser("cue", help="send an OSC cue to the cues port")
+    p.add_argument("path", help="OSC path, e.g. /trigger/bass")
+    p.add_argument("args", nargs="*", help="arguments (ints/floats/strings)")
+    p.set_defaults(func=cmd_cue)
+
+    p = sub.add_parser("info", help="show discovered ports and token")
+    p.set_defaults(func=cmd_info)
+
+    args = parser.parse_args(argv)
+
+    # Keep the watcher's output live when piped into a log or another tool.
+    sys.stdout.reconfigure(line_buffering=True)
+
+    try:
+        sp = SonicPi.discover()
+    except NotRunning as e:
+        print(f"spi: {e}", file=sys.stderr)
+        return 1
+
+    try:
+        return args.func(sp, args)
+    except OSError as e:
+        print(f"spi: {e}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
