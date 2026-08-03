@@ -8,12 +8,15 @@ discovering its (dynamic) ports and auth token from the process table.
   spi eval CODE           evaluate a string (or stdin with -)
   spi stop                stop all jobs
   spi watch PATH...       re-run files whenever they change
+  spi watch DIR -x FILE   watch DIR, but always re-run FILE
   spi info                show the discovered ports and token
 """
 
 import argparse
+import fnmatch
 import os
 import re
+import threading
 import socket
 import struct
 import subprocess
@@ -21,6 +24,11 @@ import sys
 import time
 
 DEFAULT_EXTS = (".rb", ".spi", ".sonicpi")
+SPIDER_LOG = os.path.expanduser("~/.sonic-pi/log/spider.log")
+LOG_PORT = 4569
+MIDI_PORT = "IAC Driver"
+NOISE = ("HEAP:", "Pausing SuperSonic", "PROCESS STALL",
+         "Contents/Resources/app/server/ruby")
 
 
 # --- OSC ---------------------------------------------------------------
@@ -148,12 +156,24 @@ def display_name(path: str) -> str:
 
 def cmd_run(sp: SonicPi, args) -> int:
     code = read_source(args.file)
+
+    if args.log:
+        start_streams(args)
+
     if args.stop_first:
         sp.stop()
         time.sleep(0.05)
     sp.run_code(code, workspace_name(args.file))
     if not args.quiet:
         print(f"-> ran {args.file}")
+
+    if args.log:
+        print("  ctrl-c to quit")
+        try:
+            while True:
+                time.sleep(0.5)
+        except KeyboardInterrupt:
+            print("\nbye")
     return 0
 
 
@@ -186,6 +206,201 @@ def cmd_cue(sp: SonicPi, args) -> int:
     return 0
 
 
+def osc_strings(data: bytes):
+    return [
+        m.decode("utf-8", "replace")
+        for m in re.findall(rb"[\x20-\x7e]{2,}", data)
+        if not m.startswith(b"/") and not m.startswith(b",")
+    ]
+
+
+def format_event(text, domains=None):
+    parts = text.split(None, 3)
+    if len(parts) < 3:
+        return text
+    domain, entity = parts[1], parts[2]
+    if domains and domain not in domains:
+        return None
+    fields = parts[3] if len(parts) > 3 else ""
+    return f"{domain:<10} {entity:<13} {fields}"
+
+
+def stream_log(path: str, port: int, show_all: bool, domains=None) -> None:
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setblocking(False)
+        sock.bind(("127.0.0.1", port))
+        f = open(path, "r", errors="replace")
+    except OSError as e:
+        print(f"spi: log stream unavailable: {e}", file=sys.stderr)
+        return
+    f.seek(0, os.SEEK_END)
+
+    previous = None
+    while True:
+        for line in f:
+            line = line.rstrip("\n")
+            if line == previous:
+                continue
+            if not show_all and any(n in line for n in NOISE):
+                continue
+            previous = line
+            print(line)
+        while True:
+            try:
+                data, _ = sock.recvfrom(8192)
+            except BlockingIOError:
+                break
+            now = time.time()
+            stamp = time.strftime("%H:%M:%S") + f".{int(now % 1 * 1000):03d}"
+            for s in osc_strings(data):
+                if s.startswith("evt "):
+                    s = format_event(s, domains)
+                    if s is None:
+                        continue
+                print(f"[{stamp}] {s}")
+        time.sleep(0.02)
+
+
+def cmd_log(sp: SonicPi, args) -> int:
+    print(f"tailing {args.file}")
+    print(f"  udp {args.port} for osc_send from your code")
+    print("  ctrl-c to quit")
+    try:
+        stream_log(args.file, args.port, args.all)
+    except KeyboardInterrupt:
+        print("\nbye")
+    return 0
+
+
+MIDI_NAMES = {0x80: "note_off", 0x90: "note_on", 0xA0: "aftertouch",
+              0xB0: "cc", 0xC0: "program", 0xD0: "chan_pressure", 0xE0: "bend"}
+CC_NAMES = {1: "modwheel", 7: "volume", 10: "pan", 74: "cutoff", 71: "resonance"}
+CHANNEL_ROLES = {1: "break", 2: "reverse", 3: "acid", 4: "chords"}
+NOTE_NAMES = ("C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B")
+
+
+def note_name(n):
+    return f"{NOTE_NAMES[n % 12]}{n // 12 - 1}"
+
+
+def describe_midi(data, slice_channels, slice_base):
+    status = data[0] & 0xF0
+    channel = (data[0] & 0x0F) + 1
+    name = MIDI_NAMES.get(status, f"status_{data[0]:02x}")
+    role = CHANNEL_ROLES.get(channel, "")
+    where = f"ch{channel:<2} {role:<8}"
+
+    if status == 0xE0 and len(data) >= 3:
+        cents = (((data[2] << 7) | data[1]) - 8192) / 8192.0
+        return f"{where} {name:<9} {cents:+.3f}"
+
+    if status in (0x80, 0x90) and len(data) >= 3:
+        if status == 0x90 and data[2] == 0:
+            name = "note_off"
+        if channel in slice_channels:
+            what = f"slice {data[1] - slice_base:<3} (note {data[1]})"
+        else:
+            what = f"{note_name(data[1]):<4} (note {data[1]})"
+        return f"{where} {name:<9} {what:<20} vel={data[2]}"
+
+    if status == 0xB0 and len(data) >= 3:
+        cc = CC_NAMES.get(data[1], f"cc{data[1]}")
+        return f"{where} {name:<9} {cc:<20} {data[2]}"
+
+    if len(data) >= 3:
+        return f"{where} {name:<9} {data[1]}={data[2]}"
+    return f"{where} {name:<9} {data[1:]}"
+
+
+def short_port(name):
+    return name.replace("IAC Driver ", "").replace(" ", "")
+
+
+def stream_midi(port_name, channels=None, slice_channels=(1, 2), slice_base=36):
+    try:
+        import rtmidi
+    except ImportError:
+        print("spi: midi stream needs python-rtmidi (pip3 install python-rtmidi)",
+              file=sys.stderr)
+        return
+
+    ports = rtmidi.MidiIn().get_ports()
+    matches = [i for i, p in enumerate(ports) if port_name.lower() in p.lower()]
+    if not matches:
+        print(f"spi: no midi port matching {port_name!r}", file=sys.stderr)
+        for i, p in enumerate(ports):
+            print(f"  {i}  {p}", file=sys.stderr)
+        return
+
+    inputs = []
+    for i in matches:
+        handle = rtmidi.MidiIn()
+        handle.open_port(i)
+        handle.ignore_types(sysex=False, timing=False, active_sense=True)
+        inputs.append((short_port(ports[i]), handle))
+    print(f"midi: {', '.join(label for label, _ in inputs)}")
+
+    slice_channels = set(slice_channels)
+    labelled = len(inputs) > 1
+    held = {}
+    previous = None
+    while True:
+        data = source = None
+        for label, handle in inputs:
+            msg = handle.get_message()
+            if msg and msg[0]:
+                data, source = msg[0], label
+                break
+        if not data:
+            time.sleep(0.001)
+            continue
+        if channels and (data[0] & 0x0F) + 1 not in channels:
+            continue
+
+        now = time.time()
+        status = data[0] & 0xF0
+        key = (data[0] & 0x0F, data[1]) if len(data) > 1 else None
+        extra = ""
+        if status == 0x90 and len(data) > 2 and data[2] > 0:
+            held[key] = now
+        elif status == 0x80 or (status == 0x90 and len(data) > 2):
+            if key in held:
+                extra = f"  held={(now - held.pop(key)) * 1000:.0f}ms"
+
+        gap = (now - previous) * 1000 if previous else 0.0
+        raw = " ".join(f"{b:02x}" for b in data)
+        extra += f"  +{gap:.1f}ms  [{raw}]"
+        previous = now
+
+        stamp = time.strftime("%H:%M:%S") + f".{int(now % 1 * 1000):03d}"
+        where = f"{source} " if labelled else ""
+        print(f"[{stamp}] {where}{describe_midi(data, slice_channels, slice_base)}{extra}")
+
+
+def start_streams(args) -> None:
+    domains = set(getattr(args, "source", None) or ())
+    threading.Thread(
+        target=stream_log, args=(SPIDER_LOG, LOG_PORT, False, domains), daemon=True
+    ).start()
+    threading.Thread(
+        target=stream_midi,
+        args=(getattr(args, "midi_port", MIDI_PORT), getattr(args, "channel", None)),
+        daemon=True,
+    ).start()
+    time.sleep(0.2)
+
+
+def cmd_midi(sp: SonicPi, args) -> int:
+    print("  ctrl-c to quit")
+    try:
+        stream_midi(args.port, args.channel,
+                    args.slice_channel or (1, 2), args.slice_base)
+    except KeyboardInterrupt:
+        print("\nbye")
+    return 0
+
+
 def cmd_info(sp: SonicPi, args) -> int:
     print(f"pid           {sp.pid}")
     print(f"send to       127.0.0.1:{sp.listen}   (spider listens here)")
@@ -198,58 +413,99 @@ def cmd_info(sp: SonicPi, args) -> int:
 
 # --- watch -------------------------------------------------------------
 
-def collect(paths, exts):
-    """Expand the watch targets into a {path: mtime} snapshot."""
+def collect(paths, exts, exclude=()):
     found = {}
     for p in paths:
         if os.path.isdir(p):
             for root, dirs, files in os.walk(p):
-                dirs[:] = [d for d in dirs if not d.startswith(".")]
+                dirs[:] = [
+                    d for d in dirs
+                    if not d.startswith(".")
+                    and not any(fnmatch.fnmatch(d, pat) for pat in exclude)
+                ]
                 for name in files:
                     if name.startswith(".") or not name.endswith(exts):
                         continue
-                    f = os.path.join(root, name)
+                    f = os.path.abspath(os.path.join(root, name))
                     try:
                         found[f] = os.stat(f).st_mtime
                     except OSError:
                         pass
         else:
+            f = os.path.abspath(p)
             try:
-                found[p] = os.stat(p).st_mtime
+                found[f] = os.stat(f).st_mtime
             except OSError:
-                found[p] = None
+                found[f] = None
     return found
+
+
+def is_ignored(path: str) -> bool:
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            return "spi:ignore" in f.read(512)
+    except OSError:
+        return False
 
 
 def cmd_watch(sp: SonicPi, args) -> int:
     exts = tuple(e if e.startswith(".") else "." + e for e in args.ext) \
         if args.ext else DEFAULT_EXTS
     paths = args.paths or ["."]
+    exclude = tuple(args.exclude or ())
+    entry = args.exec_file
 
-    seen = collect(paths, exts)
+    if entry:
+        if not os.path.isfile(entry):
+            print(f"spi: no such file: {entry}", file=sys.stderr)
+            return 1
+        paths = list(paths) + [entry]
+
+    if args.log:
+        start_streams(args)
+
+    seen = collect(paths, exts, exclude)
     print(f"watching {', '.join(paths)} (pid {sp.pid}, port {sp.listen})")
     print(f"  {len(seen)} file(s), extensions: {' '.join(exts)}")
+    if exclude:
+        print(f"  excluding: {' '.join(exclude)}")
+    if entry:
+        print(f"  any change re-runs {display_name(entry)}")
     if args.run_now:
-        for f in sorted(seen):
-            safe_fire(sp, f, args)
+        if entry:
+            safe_fire(sp, entry, args)
+        else:
+            for f in sorted(seen):
+                safe_fire(sp, f, args)
     print("  ctrl-c to quit")
 
     try:
         while True:
             time.sleep(args.interval)
-            current = collect(paths, exts)
+            current = collect(paths, exts, exclude)
             changed = [
                 f for f, m in current.items()
                 if m is not None and seen.get(f) != m
             ]
+            removed = [f for f in seen if f not in current] if entry else []
             seen = current
-            if not changed:
+            if not changed and not removed:
                 continue
             # Debounce: let a burst of saves settle before firing.
             time.sleep(args.interval)
-            seen = collect(paths, exts)
-            for f in sorted(changed):
-                safe_fire(sp, f, args)
+            seen = collect(paths, exts, exclude)
+            if entry:
+                trigger = [f for f in sorted(changed) if not is_ignored(f)]
+                trigger += [f for f in sorted(removed) if f not in seen]
+                if not trigger:
+                    continue
+                stamp = time.strftime("%H:%M:%S")
+                names = ", ".join(display_name(f) for f in trigger)
+                print(f"[{stamp}] ~ {names}")
+                safe_fire(sp, entry, args)
+            else:
+                for f in sorted(changed):
+                    safe_fire(sp, f, args)
     except KeyboardInterrupt:
         print("\nbye")
         return 0
@@ -306,6 +562,10 @@ def main(argv=None) -> int:
     p.add_argument("file")
     p.add_argument("-s", "--stop-first", action="store_true",
                    help="stop all jobs before running")
+    p.add_argument("-l", "--log", action="store_true",
+                   help="stream errors, events and midi until ctrl-c")
+    p.add_argument("--source", action="append", metavar="NAME",
+                   help="only show events from this live loop (repeatable)")
     p.set_defaults(func=cmd_run)
 
     p = sub.add_parser("eval", help="evaluate a string ('-' reads stdin)")
@@ -318,9 +578,14 @@ def main(argv=None) -> int:
     p = sub.add_parser("watch", help="re-run files whenever they change")
     p.add_argument("paths", nargs="*", metavar="PATH",
                    help="files or directories to watch (default: .)")
+    p.add_argument("-x", "--exec", dest="exec_file", metavar="FILE",
+                   help="re-run FILE on any change, instead of running "
+                        "whichever file changed")
     p.add_argument("-e", "--ext", action="append", metavar="EXT",
                    help="file extension to watch (repeatable; "
                         f"default: {' '.join(DEFAULT_EXTS)})")
+    p.add_argument("-X", "--exclude", action="append", metavar="GLOB",
+                   help="directory name to skip (repeatable, e.g. _OLD)")
     p.add_argument("-i", "--interval", type=float, default=0.2,
                    metavar="SECS", help="poll interval (default: 0.2)")
     p.add_argument("-s", "--stop-first", dest="stop_first", action="store_true",
@@ -329,12 +594,36 @@ def main(argv=None) -> int:
                    action="store_false", help="leave running jobs alone")
     p.add_argument("-n", "--run-now", action="store_true",
                    help="run everything once on startup")
+    p.add_argument("-l", "--log", action="store_true",
+                   help="also stream errors, events and midi to this terminal")
+    p.add_argument("--source", action="append", metavar="NAME",
+                   help="only show events from this live loop (repeatable)")
     p.set_defaults(func=cmd_watch)
 
     p = sub.add_parser("cue", help="send an OSC cue to the cues port")
     p.add_argument("path", help="OSC path, e.g. /trigger/bass")
     p.add_argument("args", nargs="*", help="arguments (ints/floats/strings)")
     p.set_defaults(func=cmd_cue)
+
+    p = sub.add_parser("log", help="stream errors and your own output to the terminal")
+    p.add_argument("-f", "--file", default=SPIDER_LOG, metavar="PATH",
+                   help=f"log file to tail (default: {SPIDER_LOG})")
+    p.add_argument("-p", "--port", type=int, default=LOG_PORT, metavar="PORT",
+                   help=f"udp port to receive osc_send on (default: {LOG_PORT})")
+    p.add_argument("-a", "--all", action="store_true",
+                   help="include heap and studio noise")
+    p.set_defaults(func=cmd_log)
+
+    p = sub.add_parser("midi", help="monitor midi traffic on a port")
+    p.add_argument("-p", "--port", default=MIDI_PORT, metavar="NAME",
+                   help=f"midi input port, substring match (default: {MIDI_PORT})")
+    p.add_argument("-c", "--channel", type=int, action="append", metavar="N",
+                   help="only show this channel (repeatable)")
+    p.add_argument("-S", "--slice-channel", type=int, action="append", metavar="N",
+                   help="channel whose notes are slice indices (default: 1, 2)")
+    p.add_argument("-b", "--slice-base", type=int, default=36, metavar="NOTE",
+                   help="base note of the sliced instrument (default: 36)")
+    p.set_defaults(func=cmd_midi)
 
     p = sub.add_parser("info", help="show discovered ports and token")
     p.set_defaults(func=cmd_info)
