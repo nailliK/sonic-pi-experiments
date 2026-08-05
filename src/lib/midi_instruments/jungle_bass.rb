@@ -6,7 +6,7 @@ set :reese_channel, 6
 set :sub_octave, -12
 set :reese_octave, 0
 set :bass_sustain, 0.9
-set :bass_degrees, [1, 3, 6, 7].ring
+set :bass_degrees, [1, 4, 5, 3, 6, 7, 9, 3].ring
 set :bass_cell, [3, 4, 1]
 set :bass_fill_cell, [1, 1, 2]
 

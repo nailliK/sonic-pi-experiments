@@ -4,7 +4,6 @@ set :slice_port, "iac_driver_bus_1"
 set :slice_channel, 10
 set :slice_root, 36
 set :slice_total, 32
-set :slice_pattern, [0, 1, [2, 7].choose, 0, 1, [2, 7].choose, 1, 2].ring
 set :slice_effect_chance, 0.15
 set :slice_fill_chance, 0.75
 set :slice_retrigs, [2, 3, 4, 6, 8]
@@ -43,6 +42,10 @@ def slice_velocity (slice, num_retrigs, sustain, channel, direction)
   end
 end
 
+def slice_pattern
+  [0, 1, [2, 7].choose, 0, 1, [2, 7].choose, 1, 2].ring
+end
+
 def slice_ghost (slice)
   midi get(:slice_root) + slice, sustain: get(:slice_sustain) / 2, vel_f: get(:slice_ghost_velocity), port: get(:slice_port), channel: get(:slice_channel)
 end
@@ -78,7 +81,7 @@ live_loop :slice do
   next unless arrangement_playing? :slice, look
 
   step = arrangement_halftime?(look) ? 4 : 2
-  slice = get(:slice_pattern)[look / step]
+  slice = slice_pattern[look / step]
 
   if look.odd?
     slice_ghost slice if rrand(0, 1) < get(:slice_ghost_chance)
