@@ -1,69 +1,47 @@
 # frozen_string_literal: true
 
 set :global_bpm, :link
-set :global_quantum, 4
-set :global_lines_per_beat, 4.0
-set :global_start, 0 if get(:global_start).nil?
-set :global_seed, 666 if get(:global_seed).nil?
+set :global_pulse, 4.0
+set :global_bar_ticks, 16
 
-eval_file "#{get(:dir_root)}/lib/log.rb"
+link
+use_bpm get(:global_bpm)
 
-use_cue_logging false
+set :global_look, 0
 
-link_sync get(:global_quantum)
-set :global_start, 1
+live_loop :transport_watch do
+  set :global_start, (@link_api.link_is_playing? ? 1 : 0)
 
-define :global_look do
-  (beat * get(:global_lines_per_beat)).floor
+  sleep 4
 end
-
-define :link_cycle do |cycle_beats|
-  global_look / (cycle_beats * get(:global_lines_per_beat)).to_i
-end
-
-define :link_bar do
-  link_cycle(get(:global_quantum))
-end
-
-define :await_start do
-  next unless get(:global_start) == 0
-
-  sync :global_started
-  link get(:global_quantum)
-end
-
-set :song_origin_bar, link_bar
 
 live_loop :transport_start do
   use_real_time
   sync "/link/start"
+
   set :global_start, 1
-  set :song_origin_bar, link_bar
-  cue :global_started
-  emit :start, bpm: current_bpm.round(2), bar: link_bar
+
+  puts "START"
+  cue :global_start_queue
 end
 
 live_loop :transport_stop do
   use_real_time
   sync "/link/stop"
+
   set :global_start, 0
-  cue :global_stopped
-  emit :stop, bar: link_bar
+
+  puts "STOP"
+  cue :global_stop_queue
 end
 
-live_loop :heartbeat, auto_cue: false do
-  emit :tick,
-       look: global_look,
-       bar: link_bar,
-       beat: beat.round(3),
-       bpm: current_bpm.round(2),
-       start: get(:global_start)
-  sleep 1.0 / get(:global_lines_per_beat)
-end
+live_loop :global_clock do
+  use_real_time
 
-live_loop :randomization, auto_cue: false do
-  set :global_seed, rand_i(441000)
+  if get(:global_start) == 1
+    cue :global_tick
+    set :global_look, get(:global_look) + 1
+  end
 
-  # new seed after bar
-  sleep 1.0 / get(:global_lines_per_beat)
+  sleep 1.0 / get(:global_pulse)
 end

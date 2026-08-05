@@ -1,27 +1,32 @@
 # frozen_string_literal: true
 
-set :arrangement_step_bars, 8
-set :arrangement_offset, 0
+set :arrangement_section_bars, 8
 
-define :register_track do |name, pattern|
-  set :"track_#{name}", pattern.delete(" ").chars.ring
-  set :track_names, ((get(:track_names) || []) + [name]).uniq
+def arrangement_parts
+  {
+    slice: [1, 1, 1, 0],
+    sub: [0, 1, 1, 1],
+    reese: [0, 0, 1, 1],
+    chords: [1, 0, 1, 1]
+  }
 end
 
-define :arrangement_step do
-  elapsed = link_bar - get(:song_origin_bar).to_i
-  elapsed / get(:arrangement_step_bars) + get(:arrangement_offset).to_i
+def arrangement_bar (look)
+  look / get(:global_bar_ticks)
 end
 
-define :playing? do |name|
-  next false unless get(:global_start) == 1
-
-  row = get(:"track_#{name}")
-  row.nil? || row[arrangement_step] == "#"
+def arrangement_section (look)
+  arrangement_bar(look) / get(:arrangement_section_bars)
 end
 
-live_loop :arrangement, auto_cue: false do
-  tracks = (get(:track_names) || []).map { |n| "#{n}=#{playing?(n)}" }.join(" ")
-  emit :step, step: arrangement_step, tracks: tracks
-  sleep get(:global_quantum)
+def arrangement_playing? (part, look)
+  arrangement_parts[part].ring[arrangement_section(look)] == 1
+end
+
+def arrangement_halftime? (look)
+  [0, 1, 0, 0].ring[arrangement_section(look)] == 1
+end
+
+def arrangement_fill? (look)
+  arrangement_bar(look) % get(:arrangement_section_bars) == get(:arrangement_section_bars) - 1
 end
